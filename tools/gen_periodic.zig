@@ -1,0 +1,923 @@
+//! Generates periodic structure tables for src/structures.zig.
+//!
+//! A tiling is given by the polygons of one rectangular period (width W,
+//! height H); the program finds the neighbours of every cell, arranges the
+//! cells in a grid of slots (rows: bands of equal cell count sorted by y,
+//! columns: sorted by x), orders every cell's walls counter clockwise starting
+//! at the top edge (like the hand written tables), merges cells with identical
+//! neighbourhoods into cell types and prints the Zig code.
+//!
+//! Coordinates are printed as exact expressions over a basis of square roots
+//! (e.g. 1/2 + 1/3*sqrt(3)); every value must be such a combination with
+//! small rational coefficients, which also checks the geometry.
+//!
+//! usage: zig build gen-periodic -- TILING [ROWS]
+//!        (TILING: 4.6.12, floret, pentagonal_1:1, pentagonal_1:2,
+//!         pentagonal_2:1, pentagonal_2:2, pentagonal_10;
+//!         ROWS: rows of the table, default 6)
+//!    or: zig run tools/gen_periodic.zig -- TILING [ROWS]
+//!
+//! The output is meant to be pasted into src/structures.zig and formatted
+//! with `zig fmt`.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
+
+const S3: f64 = @sqrt(3.0);
+const EPS = 1e-7;
+
+const Vec = struct { x: f64, y: f64 };
+
+/// A polygon of the tiling (vertices in any orientation) and optionally its
+/// center; the centroid is used otherwise.
+const Poly = struct {
+    v: []const Vec,
+    center: ?Vec = null,
+};
+
+const Tiling = struct {
+    /// Zig struct name, identifier prefix, display name
+    struct_name: []const u8,
+    ident: []const u8,
+    title: []const u8,
+    width: f64,
+    height: f64,
+    /// the cells of one lattice point: with a centered lattice the period
+    /// W x H contains them and their translate by (W/2, H/2), with a
+    /// rectangular lattice they are the whole period
+    polys: []const Poly,
+    lattice: enum { centered, rectangular } = .centered,
+    /// one or two basis constants of the coordinates ("1" or "SQRTn")
+    basis: []const []const u8,
+};
+
+// ---------------------------------------------------------------------------
+// tilings
+
+/// Regular n-gon; `normal0` is the direction (radians) of the first edge's
+/// normal. Vertices counter clockwise.
+fn regular(arena: Allocator, center: Vec, n: usize, inradius: f64, normal0: f64) ![]Vec {
+    const radius = inradius / @cos(std.math.pi / @as(f64, @floatFromInt(n)));
+    const v = try arena.alloc(Vec, n);
+    for (v, 0..) |*p, k| {
+        const a = normal0 + (@as(f64, @floatFromInt(k)) + 0.5) * 2 * std.math.pi / @as(f64, @floatFromInt(n));
+        p.* = .{ .x = center.x + radius * @cos(a), .y = center.y + radius * @sin(a) };
+    }
+    return v;
+}
+
+fn radians(deg: f64) f64 {
+    return deg * std.math.pi / 180;
+}
+
+/// 4.6.12: dodecagons on a triangular lattice, hexagons at the centers of the
+/// lattice triangles, squares at the lattice edges. Edge length 1. The cells
+/// around lattice point 0: a dodecagon, two hexagons, three squares.
+fn truncatedTrihexagonal(arena: Allocator) !Tiling {
+    const r12 = (2 + S3) / 2.0; // inradius dodecagon
+    const l: f64 = 3 + S3; // lattice spacing (dodecagon - square - dodecagon)
+    var polys: std.ArrayList(Poly) = .empty;
+    try polys.append(arena, .{ .v = try regular(arena, .{ .x = 0, .y = 0 }, 12, r12, 0) });
+    for ([_]f64{ 30, 90 }) |a| { // hexagons in the up and down triangle
+        const d = l / S3;
+        const c: Vec = .{ .x = d * @cos(radians(a)), .y = d * @sin(radians(a)) };
+        try polys.append(arena, .{ .v = try regular(arena, c, 6, S3 / 2, radians(30)) });
+    }
+    for ([_]f64{ 0, 60, 120 }) |a| { // squares between two dodecagons
+        const c: Vec = .{ .x = l / 2 * @cos(radians(a)), .y = l / 2 * @sin(radians(a)) };
+        try polys.append(arena, .{ .v = try regular(arena, c, 4, 0.5, radians(a)) });
+    }
+    return .{
+        .struct_name = "TruncatedTrihexagonal",
+        .ident = "truncated_trihexagonal",
+        .title = "Square, Hexagon & Dodecagon",
+        .width = l,
+        .height = l * S3,
+        .polys = polys.items,
+        .basis = &.{ "1", "SQRT3" },
+    };
+}
+
+/// Dual of the snub hexagonal tiling 3.3.3.3.6, whose vertices are the points
+/// of a unit triangular lattice without an index 7 sublattice (the hexagon
+/// centers). Every remaining lattice point becomes a pentagon whose corners
+/// are the centers of the five faces around it (4 triangles, 1 hexagon). The
+/// tiling is rotated so that the sublattice vector (5/2, √3/2) (length √7) is
+/// horizontal; the period is then √7 x √21 with 12 cells.
+fn floretPentagonal(arena: Allocator) !Tiling {
+    const L = struct {
+        fn lp(i: i32, j: i32) Vec {
+            const fi: f64 = @floatFromInt(i);
+            const fj: f64 = @floatFromInt(j);
+            return .{ .x = fi + 0.5 * fj, .y = fj * S3 / 2 };
+        }
+        /// the index 7 sublattice generated by 2e1+e2 and -e1+3e2
+        fn hexc(i: i32, j: i32) bool {
+            return @mod(i + 5 * j, 7) == 0;
+        }
+    };
+    std.debug.assert(L.hexc(2, 1) and L.hexc(-1, 3));
+    const ang = -std.math.atan2(S3 / 2.0, 5.0 / 2.0);
+    const ca = @cos(ang);
+    const sa = @sin(ang);
+    const rot = struct {
+        fn f(c: f64, s: f64, p: Vec) Vec {
+            return .{ .x = c * p.x - s * p.y, .y = s * p.x + c * p.y };
+        }
+    }.f;
+
+    const nbr = [_][2]i32{ .{ 1, 0 }, .{ 0, 1 }, .{ -1, 1 }, .{ -1, 0 }, .{ 0, -1 }, .{ 1, -1 } }; // ccw
+    var polys: std.ArrayList(Poly) = .empty;
+    for (nbr) |ij| { // the six pentagons around the hexagon at 0
+        const i = ij[0];
+        const j = ij[1];
+        const v = L.lp(i, j);
+        var corners: std.ArrayList(Vec) = .empty;
+        for (0..6) |k| {
+            const a = nbr[k];
+            const b = nbr[(k + 1) % 6];
+            const pa = [2]i32{ i + a[0], j + a[1] };
+            const pb = [2]i32{ i + b[0], j + b[1] };
+            if (L.hexc(pa[0], pa[1])) {
+                try corners.append(arena, rot(ca, sa, L.lp(pa[0], pa[1]))); // hexagon center
+            } else if (L.hexc(pb[0], pb[1])) {
+                continue; // the hexagon, added with the next pair
+            } else {
+                const q1 = L.lp(pa[0], pa[1]); // triangle v, pa, pb
+                const q2 = L.lp(pb[0], pb[1]);
+                try corners.append(arena, rot(ca, sa, .{ .x = (v.x + q1.x + q2.x) / 3, .y = (v.y + q1.y + q2.y) / 3 }));
+            }
+        }
+        std.debug.assert(corners.items.len == 5);
+        // the cell's center is the lattice point (the centroid has unwieldy coordinates)
+        try polys.append(arena, .{ .v = corners.items, .center = rot(ca, sa, v) });
+    }
+    return .{
+        .struct_name = "FloretPentagonal",
+        .ident = "floret",
+        .title = "Floret Pentagonal",
+        .width = @sqrt(7.0),
+        .height = @sqrt(21.0),
+        .polys = polys.items,
+        .basis = &.{ "SQRT7", "SQRT21" },
+    };
+}
+
+/// Pentagonal tiling of type 1 (B + C = 180°, A + D + E = 360°), the p2 one
+/// of Wikipedia's "Pentagonal tiling" table: two pentagons glued along the
+/// edge b form a centrally symmetric hexagon, which tiles the plane by
+/// translations. The hexagon and the cut follow the Wikipedia figure
+/// (rectangular lattice): vertices v1..v6 with
+/// v1 + v2 = (-W, 0) and v2 + v3 = (0, -H), the cut from a point P on the
+/// edge v2-v3 to -P on the edge v5-v6. Period W x H = 7/4 x 1 with 2 cells.
+/// The tiling is not edge-to-edge (the cuts of neighbouring hexagons meet the
+/// shared edge at different points), so every pentagon has six neighbours.
+fn pentagonalType1(arena: Allocator) !Tiling {
+    const v = [6]Vec{
+        .{ .x = -1.0, .y = 5.0 / 16.0 },
+        .{ .x = -3.0 / 4.0, .y = -5.0 / 16.0 },
+        .{ .x = 3.0 / 4.0, .y = -11.0 / 16.0 },
+        .{ .x = 1.0, .y = -5.0 / 16.0 },
+        .{ .x = 3.0 / 4.0, .y = 5.0 / 16.0 },
+        .{ .x = -3.0 / 4.0, .y = 11.0 / 16.0 },
+    };
+    // a third of the way from v2 to v3, and the opposite point
+    const p: Vec = .{ .x = v[1].x + (v[2].x - v[1].x) / 3, .y = v[1].y + (v[2].y - v[1].y) / 3 };
+    const q: Vec = .{ .x = -p.x, .y = -p.y };
+    const polys = try arena.alloc(Poly, 2);
+    polys[0] = .{ .v = try arena.dupe(Vec, &.{ p, v[2], v[3], v[4], q }) };
+    polys[1] = .{ .v = try arena.dupe(Vec, &.{ q, v[5], v[0], v[1], p }) };
+    return .{
+        .struct_name = "PentagonType1",
+        .ident = "pentagon_1",
+        .title = "Pentagon (Type 1, p2)",
+        .width = 7.0 / 4.0,
+        .height = 1,
+        .polys = polys,
+        .lattice = .rectangular,
+        .basis = &.{"1"},
+    };
+}
+
+/// Pentagonal tiling of type 1 with a = c, d = e, A + B = 180°,
+/// C + D + E = 360°, the cm (p1 if mirror images count as different) one of
+/// Wikipedia's "Pentagonal tiling" table. As a = c and A + B = 180°, the
+/// pentagon is the parallelogram ABCE with the isosceles triangle CDE on top.
+/// A pentagon and its mirror image, glued along the edge b = AB, form a
+/// chevron; the chevrons are stacked in columns (sharing a and c), and the
+/// apexes D of neighbouring columns interlock (sharing d and e), every second
+/// column shifted by half a chevron: a centered lattice. Edge-to-edge, so
+/// every pentagon has five neighbours. With b = 1, the parallelogram
+/// 1/2 wide and sheared by -1/4, and the apex 1/4 beyond CE, the period is
+/// 5/2 x 1.
+fn pentagonalType1Cm(arena: Allocator) !Tiling {
+    // A, E, D, C, B of the pentagon right of b (counter clockwise)
+    const right = [_]Vec{
+        .{ .x = 0, .y = 0 },
+        .{ .x = 1.0 / 2.0, .y = -1.0 / 4.0 },
+        .{ .x = 3.0 / 4.0, .y = 1.0 / 4.0 },
+        .{ .x = 1.0 / 2.0, .y = 3.0 / 4.0 },
+        .{ .x = 0, .y = 1 },
+    };
+    var left: [5]Vec = undefined;
+    for (&left, right) |*l, r| l.* = .{ .x = -r.x, .y = r.y };
+    const polys = try arena.alloc(Poly, 2);
+    polys[0] = .{ .v = try arena.dupe(Vec, &left) };
+    polys[1] = .{ .v = try arena.dupe(Vec, &right) };
+    return .{
+        .struct_name = "PentagonType1Cm",
+        .ident = "pentagon_1_cm",
+        .title = "Pentagon (Type 1, cm)",
+        .width = 5.0 / 2.0,
+        .height = 1,
+        .polys = polys,
+        .basis = &.{"1"},
+    };
+}
+
+/// The four tiles of an isohedral pgg tiling: the prototile `p`, its
+/// rotation by 180° about the origin and its images under the glide
+/// reflection (x, y) -> (x + g, h - y) along a horizontal axis and the
+/// glide along a vertical axis (its rotation). With the glide axes parallel
+/// to the coordinate axes all images of rational points stay rational; the
+/// period is 2|g| x 2|h|.
+fn pggTiles(arena: Allocator, p: []const Vec, g: f64, h: f64) ![]Poly {
+    const polys = try arena.alloc(Poly, 4);
+    for (polys, 0..) |*poly, k| {
+        const v = try arena.alloc(Vec, p.len);
+        for (v, p) |*d, s| d.* = switch (k) {
+            0 => s,
+            1 => .{ .x = -s.x, .y = -s.y },
+            2 => .{ .x = s.x + g, .y = h - s.y },
+            else => .{ .x = -s.x - g, .y = s.y - h },
+        };
+        poly.* = .{ .v = v };
+    }
+    return polys;
+}
+
+/// Pentagonal tiling of type 2 (c = e, B + D = 180°), the first figure of
+/// Wikipedia's "Pentagonal tiling" table (pgg). The prototile's edge AB lies
+/// on a line through a 2-fold rotation centre (the origin), and the glide
+/// reflection M with M(D) = B, M(E) = C and M(C) = -A places the mirror
+/// image next to it; that determines the pentagon from A, B = μA and the
+/// glide (g, h): C = (-Ax - g, h + Ay), D = (μAx - g, h - μAy),
+/// E = (-Ax - 2g, -Ay). The parameters approximate the Wikipedia figure.
+/// Not edge-to-edge (B of one tile lies on the edge d of another), so some
+/// pentagons have more than five neighbours.
+fn pentagonalType2(arena: Allocator) !Tiling {
+    const a: Vec = .{ .x = 3.0 / 4.0, .y = 1.0 / 4.0 };
+    const mu = 2.0 / 5.0;
+    const g = -1.0;
+    const h = -1.0;
+    const p = [_]Vec{
+        a,
+        .{ .x = mu * a.x, .y = mu * a.y },
+        .{ .x = -a.x - g, .y = h + a.y },
+        .{ .x = mu * a.x - g, .y = h - mu * a.y },
+        .{ .x = -a.x - 2 * g, .y = -a.y },
+    };
+    return .{
+        .struct_name = "PentagonType2",
+        .ident = "pentagon_2",
+        .title = "Pentagon (Type 2)",
+        .width = 2 * @abs(g),
+        .height = 2 * @abs(h),
+        .polys = try pggTiles(arena, &p, g, h),
+        .lattice = .rectangular,
+        .basis = &.{"1"},
+    };
+}
+
+/// Pentagonal tiling of type 2 with c = e, d = b, B + D = 180°, the
+/// edge-to-edge one of Wikipedia's table (pgg): four tiles meet at their
+/// vertex D, a 2-fold rotation centre (the origin), with the angles D, B, D,
+/// B. The glide reflection M with M(B) = D, M(A) = C and M(C) = -E places
+/// the mirror image next to the prototile, which gives B = (-g, h),
+/// C = (Ax + g, h - Ay), E = (-Ax - 2g, -Ay); d = b and c = e follow.
+/// The parameters approximate the Wikipedia figure.
+fn pentagonalType2EdgeToEdge(arena: Allocator) !Tiling {
+    const a: Vec = .{ .x = 10.0 / 7.0, .y = -1.0 / 7.0 };
+    const g = -1.0;
+    const h = -11.0 / 14.0;
+    const p = [_]Vec{
+        a,
+        .{ .x = -g, .y = h },
+        .{ .x = a.x + g, .y = h - a.y },
+        .{ .x = 0, .y = 0 },
+        .{ .x = -a.x - 2 * g, .y = -a.y },
+    };
+    return .{
+        .struct_name = "PentagonType2EdgeToEdge",
+        .ident = "pentagon_2e",
+        .title = "Pentagon (Type 2, edge-to-edge)",
+        .width = 2 * @abs(g),
+        .height = 2 * @abs(h),
+        .polys = try pggTiles(arena, &p, g, h),
+        .lattice = .rectangular,
+        .basis = &.{"1"},
+    };
+}
+
+/// Pentagonal tiling of type 10 with a = b = 2c = 2e, A = B = E = 90°,
+/// C = D = 135° (cmm), as in Wikipedia's "Pentagonal tiling" figure: the
+/// pentagon is a 2 x 2 square with a corner cut off, all vertices on a unit
+/// grid. A primitive unit has six tiles: a pair glued along d (yellow in the
+/// figure), a pair glued along c and e (red) and two single tiles (blue);
+/// the lattice is spanned by (5, 2) and (2, 5). Its smallest axis parallel
+/// rectangle would be 21 x 21, but (7, 7) and (3, -3) are orthogonal, so the
+/// tiling is turned by 45°: a centered 7√2 x 3√2 lattice. Not edge-to-edge.
+fn pentagonalType10(arena: Allocator) !Tiling {
+    // grid coordinates of the figure (y down), one primitive unit; the
+    // tiles are chosen so that their centers lie in a band of height H/2
+    // (the first red and blue tiles are moved by -(5, 2))
+    const tiles = [_][5][2]f64{
+        .{ .{ 2, 1 }, .{ 4, 1 }, .{ 4, 3 }, .{ 3, 3 }, .{ 2, 2 } }, // yellow pair
+        .{ .{ 1, 2 }, .{ 2, 2 }, .{ 3, 3 }, .{ 3, 4 }, .{ 1, 4 } },
+        .{ .{ 1, 0 }, .{ 2, 0 }, .{ 2, 2 }, .{ 0, 2 }, .{ 0, 1 } }, // red pair
+        .{ .{ 3, 3 }, .{ 5, 3 }, .{ 5, 4 }, .{ 4, 5 }, .{ 3, 5 } },
+        .{ .{ -1, -1 }, .{ 1, -1 }, .{ 1, 0 }, .{ 0, 1 }, .{ -1, 1 } }, // blue
+        .{ .{ 5, 4 }, .{ 6, 4 }, .{ 6, 6 }, .{ 4, 6 }, .{ 4, 5 } },
+    };
+    // (7, 7) becomes horizontal, (3, -3) vertical (this also turns the
+    // figure's y axis upwards)
+    const r = @sqrt(2.0) / 2.0;
+    const polys = try arena.alloc(Poly, tiles.len);
+    for (polys, tiles) |*poly, t| {
+        const v = try arena.alloc(Vec, t.len);
+        for (v, t) |*d, q| d.* = .{ .x = (q[0] + q[1]) * r, .y = (q[0] - q[1]) * r };
+        poly.* = .{ .v = v };
+    }
+    return .{
+        .struct_name = "PentagonType10",
+        .ident = "pentagon_10",
+        .title = "Pentagon (Type 10)",
+        .width = 7 * @sqrt(2.0),
+        .height = 3 * @sqrt(2.0),
+        .polys = polys,
+        .basis = &.{"SQRT2"},
+    };
+}
+
+const TILINGS = [_]struct { name: []const u8, make: *const fn (Allocator) anyerror!Tiling }{
+    .{ .name = "4.6.12", .make = &truncatedTrihexagonal },
+    .{ .name = "floret", .make = &floretPentagonal },
+    .{ .name = "pentagonal_1:1", .make = &pentagonalType1 },
+    .{ .name = "pentagonal_1:2", .make = &pentagonalType1Cm },
+    .{ .name = "pentagonal_2:1", .make = &pentagonalType2 },
+    .{ .name = "pentagonal_2:2", .make = &pentagonalType2EdgeToEdge },
+    .{ .name = "pentagonal_10", .make = &pentagonalType10 },
+};
+
+// ---------------------------------------------------------------------------
+// exact expressions
+
+const Fraction = struct {
+    num: i64,
+    den: i64,
+
+    fn init(num: i64, den: i64) Fraction {
+        const g: i64 = @intCast(std.math.gcd(@abs(num), @abs(den)));
+        const s: i64 = if (den < 0) -1 else 1;
+        return .{ .num = s * @divExact(num, g), .den = s * @divExact(den, g) };
+    }
+
+    fn isInt(f: Fraction, v: i64) bool {
+        return f.den == 1 and f.num == v;
+    }
+
+    /// `3.0` or `3.0 / 2.0` (a Zig float expression)
+    fn format(f: Fraction, w: *Writer) Writer.Error!void {
+        if (f.den == 1) {
+            try w.print("{d}.0", .{f.num});
+        } else {
+            try w.print("{d}.0 / {d}.0", .{ f.num, f.den });
+        }
+    }
+};
+
+fn basisValue(name: []const u8) f64 {
+    if (std.mem.eql(u8, name, "1")) return 1;
+    std.debug.assert(std.mem.startsWith(u8, name, "SQRT"));
+    const n = std.fmt.parseInt(u32, name[4..], 10) catch unreachable;
+    return @sqrt(@as(f64, @floatFromInt(n)));
+}
+
+/// Writes v as a*b0 + b*b1 with rationals a, b (denominator `den`); with a
+/// basis of one constant, b is 0 and a has the smallest denominator.
+fn exact(v: f64, basis: []const []const u8) ![2]Fraction {
+    if (basis.len == 1) {
+        // a single constant: the fraction with the smallest denominator
+        const b0 = basisValue(basis[0]);
+        var d: i64 = 1;
+        while (d <= 100_000) : (d += 1) {
+            const rd = v / b0 * @as(f64, @floatFromInt(d));
+            const pn = @round(rd);
+            if (@abs(rd - pn) < 1e-9 * @as(f64, @floatFromInt(d))) {
+                return .{ Fraction.init(@intFromFloat(pn), d), Fraction.init(0, 1) };
+            }
+        }
+    }
+    const den: i64 = 1680;
+    const lim: i64 = if (basis.len > 1) 12 else 0;
+    const b0 = basisValue(basis[0]);
+    const b1 = if (basis.len > 1) basisValue(basis[1]) else 0;
+    var qn: i64 = -lim * den;
+    while (qn <= lim * den) : (qn += 1) {
+        const q = @as(f64, @floatFromInt(qn)) / @as(f64, @floatFromInt(den));
+        const r = (v - q * b1) / b0;
+        const rd = r * @as(f64, @floatFromInt(den));
+        const pn = @round(rd);
+        if (@abs(rd - pn) < 1e-6) {
+            return .{ Fraction.init(@intFromFloat(pn), den), Fraction.init(qn, den) };
+        }
+    }
+    std.debug.print("cannot write {d} in basis {s}{s}{s}\n", .{ v, basis[0], if (basis.len > 1) ", " else "", if (basis.len > 1) basis[1] else "" });
+    return error.NotExact;
+}
+
+/// Prints `v` as an exact Zig expression, e.g. `1.0 / 2.0 + (1.0 / 2.0) * SQRT3`.
+fn expr(w: *Writer, v: f64, basis: []const []const u8) !void {
+    const coefs = try exact(v, basis);
+    var first = true;
+    for (basis, coefs[0..basis.len]) |name, coef| {
+        if (coef.num == 0) continue;
+        var buf: [64]u8 = undefined;
+        var term: Writer = .fixed(&buf);
+        if (std.mem.eql(u8, name, "1")) {
+            try coef.format(&term);
+        } else if (coef.isInt(1)) {
+            try term.writeAll(name);
+        } else if (coef.isInt(-1)) {
+            try term.print("-{s}", .{name});
+        } else if (coef.den == 1) {
+            try term.print("{d}.0 * {s}", .{ coef.num, name });
+        } else {
+            try term.writeAll("(");
+            try coef.format(&term);
+            try term.print(") * {s}", .{name});
+        }
+        const text = term.buffered();
+        if (first) {
+            try w.writeAll(text);
+        } else if (text[0] == '-') {
+            try w.print(" - {s}", .{text[1..]}); // `a + -b` reads better as `a - b`
+        } else {
+            try w.print(" + {s}", .{text});
+        }
+        first = false;
+    }
+    if (first) try w.writeAll("0.0");
+}
+
+// ---------------------------------------------------------------------------
+// geometry
+
+/// twice the signed area (positive for counter clockwise polygons)
+fn area2(p: []const Vec) f64 {
+    var a: f64 = 0;
+    for (p, 0..) |p0, i| {
+        const p1 = p[(i + 1) % p.len];
+        a += p0.x * p1.y - p1.x * p0.y;
+    }
+    return a;
+}
+
+fn centroid(p: []const Vec) Vec {
+    var a: f64 = 0;
+    var cx: f64 = 0;
+    var cy: f64 = 0;
+    for (p, 0..) |p0, i| {
+        const p1 = p[(i + 1) % p.len];
+        const f = p0.x * p1.y - p1.x * p0.y;
+        a += f;
+        cx += (p0.x + p1.x) * f;
+        cy += (p0.y + p1.y) * f;
+    }
+    return .{ .x = cx / (3 * a), .y = cy / (3 * a) };
+}
+
+/// points equal up to the rounding the tables are compared with
+fn same(a: Vec, b: Vec) bool {
+    return @abs(a.x - b.x) < 1e-5 and @abs(a.y - b.y) < 1e-5;
+}
+
+fn sameEdge(a0: Vec, a1: Vec, b0: Vec, b1: Vec) bool {
+    return (same(a0, b0) and same(a1, b1)) or (same(a0, b1) and same(a1, b0));
+}
+
+/// The parameter s in (0, 1) with p = a + s * (b - a) if p lies strictly
+/// inside the segment a-b.
+fn onSegment(a: Vec, b: Vec, p: Vec) ?f64 {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    const cross = dx * (p.y - a.y) - dy * (p.x - a.x);
+    if (@abs(cross) > 1e-6 * @sqrt(len2)) return null;
+    const s = (dx * (p.x - a.x) + dy * (p.y - a.y)) / len2;
+    return if (s > 1e-6 and s < 1 - 1e-6) s else null;
+}
+
+fn round6(v: f64) f64 {
+    return @round(v * 1e6) / 1e6;
+}
+
+const Neighbour = struct {
+    dx: i32,
+    dy: i32,
+    /// the wall's end points relative to the cell center
+    a: Vec,
+    b: Vec,
+};
+
+const Cell = struct {
+    poly: []const Vec,
+    center: Vec,
+    col: usize = 0,
+    row: usize = 0,
+    nbs: []Neighbour = &.{},
+    type: usize = 0,
+};
+
+const LETTERS = "ABCDEFGHIJKLMNOP";
+
+const Generated = struct {
+    code: []const u8,
+    /// e.g. `A(12),B(4)`: the cell types and their wall counts
+    summary: []const u8,
+};
+
+fn generate(arena: Allocator, which: []const u8, t: Tiling, rows: usize) !Generated {
+    const centered = t.lattice == .centered;
+    if (centered and rows % 2 != 0) {
+        std.debug.print("the number of rows must be even\n", .{});
+        return error.OddRows;
+    }
+    const half = t.polys.len;
+    // rows of the group (the full period has `rows`)
+    const bands = if (centered) rows / 2 else rows;
+    if (half % bands != 0) {
+        std.debug.print("{d} cells can't be arranged in {d} rows\n", .{ half, bands });
+        return error.BadRows;
+    }
+    const cols = half / bands;
+    if (centered and cols % 2 != 0) {
+        std.debug.print("the number of columns must be even\n", .{});
+        return error.BadRows;
+    }
+    const cells = try arena.alloc(Cell, if (centered) 2 * half else half);
+    for (t.polys, cells[0..half]) |p, *c| {
+        const v = try arena.dupe(Vec, p.v);
+        if (area2(v) < 0) std.mem.reverse(Vec, v);
+        c.* = .{ .poly = v, .center = p.center orelse centroid(v) };
+    }
+    // slots of the group: bands of equal size sorted by y, then by x
+    const order = try arena.alloc(usize, half);
+    for (order, 0..) |*o, k| o.* = k;
+    const ByCenter = struct {
+        cells: []const Cell,
+        fn yThenX(ctx: @This(), l: usize, r: usize) bool {
+            const a = ctx.cells[l].center;
+            const b = ctx.cells[r].center;
+            const ay = round6(a.y);
+            const by = round6(b.y);
+            if (ay != by) return ay < by;
+            return a.x < b.x;
+        }
+        fn byX(ctx: @This(), l: usize, r: usize) bool {
+            return ctx.cells[l].center.x < ctx.cells[r].center.x;
+        }
+    };
+    const ctx: ByCenter = .{ .cells = cells };
+    std.sort.insertion(usize, order, ctx, ByCenter.yThenX);
+    for (0..bands) |r| {
+        const band = order[r * cols .. (r + 1) * cols];
+        std.sort.insertion(usize, band, ctx, ByCenter.byX);
+        for (band, 0..) |k, col| {
+            cells[k].col = col;
+            cells[k].row = r;
+        }
+    }
+    // the translated group
+    for (0..if (centered) half else 0) |k| {
+        const c = cells[k];
+        var col = c.col + cols / 2;
+        var sx = t.width / 2;
+        if (col >= cols) {
+            col -= cols;
+            sx -= t.width;
+        }
+        const v = try arena.alloc(Vec, c.poly.len);
+        for (v, c.poly) |*d, s| d.* = .{ .x = s.x + sx, .y = s.y + t.height / 2 };
+        cells[half + k] = .{
+            .poly = v,
+            .center = .{ .x = c.center.x + sx, .y = c.center.y + t.height / 2 },
+            .col = col,
+            .row = c.row + rows / 2,
+        };
+    }
+    // tilings that are not edge-to-edge: split every edge at the vertices of
+    // other cells lying on it, so that every wall has exactly one neighbour
+    for (cells, 0..) |*c, k| {
+        var split: std.ArrayList(Vec) = .empty;
+        for (c.poly, 0..) |a, i| {
+            const b = c.poly[(i + 1) % c.poly.len];
+            try split.append(arena, a);
+            var inner: std.ArrayList(f64) = .empty;
+            for (cells, 0..) |o, ok| {
+                var tx: i32 = -2;
+                while (tx <= 2) : (tx += 1) {
+                    var ty: i32 = -2;
+                    while (ty <= 2) : (ty += 1) {
+                        if (ok == k and tx == 0 and ty == 0) continue;
+                        for (o.poly) |v| {
+                            const p: Vec = .{ .x = v.x + @as(f64, @floatFromInt(tx)) * t.width, .y = v.y + @as(f64, @floatFromInt(ty)) * t.height };
+                            const sp = onSegment(a, b, p) orelse continue;
+                            const seen = for (inner.items) |q| {
+                                if (@abs(q - sp) < 1e-6) break true;
+                            } else false;
+                            if (!seen) try inner.append(arena, sp);
+                        }
+                    }
+                }
+            }
+            std.sort.insertion(f64, inner.items, {}, std.sort.asc(f64));
+            for (inner.items) |sp| try split.append(arena, .{ .x = a.x + sp * (b.x - a.x), .y = a.y + sp * (b.y - a.y) });
+        }
+        c.poly = split.items;
+    }
+    // neighbours, starting at the edge closest to north, counter clockwise;
+    // every wall is shared with exactly one other cell (or translate)
+    for (cells, 0..) |*c, k| {
+        const p = c.poly;
+        const m = p.len;
+        var start: usize = 0;
+        var best: f64 = std.math.inf(f64);
+        for (0..m) |i| {
+            const q = p[(i + 1) % m];
+            const mid = std.math.atan2((p[i].y + q.y) / 2 - c.center.y, (p[i].x + q.x) / 2 - c.center.x);
+            const turn = @mod(mid - std.math.pi / 2.0 + 1e-9, 2 * std.math.pi);
+            if (turn < best) {
+                best = turn;
+                start = i;
+            }
+        }
+        c.nbs = try arena.alloc(Neighbour, m);
+        for (0..m) |j| {
+            const i = (start + j) % m;
+            const a = p[i];
+            const b = p[(i + 1) % m];
+            var found: ?Neighbour = null;
+            var users: usize = 0;
+            for (cells, 0..) |o, ok| {
+                var tx: i32 = -2;
+                while (tx <= 2) : (tx += 1) {
+                    var ty: i32 = -2;
+                    while (ty <= 2) : (ty += 1) {
+                        if (ok == k and tx == 0 and ty == 0) continue;
+                        const sx = @as(f64, @floatFromInt(tx)) * t.width;
+                        const sy = @as(f64, @floatFromInt(ty)) * t.height;
+                        for (o.poly, 0..) |e0, ei| {
+                            const e1 = o.poly[(ei + 1) % o.poly.len];
+                            const f0: Vec = .{ .x = e0.x + sx, .y = e0.y + sy };
+                            const f1: Vec = .{ .x = e1.x + sx, .y = e1.y + sy };
+                            if (!sameEdge(a, b, f0, f1)) continue;
+                            users += 1;
+                            found = .{
+                                .dx = tx * @as(i32, @intCast(cols)) + @as(i32, @intCast(o.col)) - @as(i32, @intCast(c.col)),
+                                .dy = ty * @as(i32, @intCast(rows)) + @as(i32, @intCast(o.row)) - @as(i32, @intCast(c.row)),
+                                .a = .{ .x = a.x - c.center.x, .y = a.y - c.center.y },
+                                .b = .{ .x = b.x - c.center.x, .y = b.y - c.center.y },
+                            };
+                        }
+                    }
+                }
+            }
+            if (users != 1) {
+                std.debug.print("cell {d} wall {d} is shared by {d} other cells\n", .{ k, j, users });
+                return error.BadTiling;
+            }
+            c.nbs[j] = found.?;
+        }
+    }
+    // cell types: identical neighbour offsets and walls, in grid order
+    var types: std.ArrayList(usize) = .empty; // representative cell of each type
+    for (0..rows) |r| for (0..cols) |col| {
+        const k = for (cells, 0..) |c, k| {
+            if (c.row == r and c.col == col) break k;
+        } else return error.EmptySlot;
+        const c = &cells[k];
+        c.type = for (types.items, 0..) |rep, ti| {
+            const nbs = cells[rep].nbs;
+            if (nbs.len != c.nbs.len) continue;
+            const equal = for (nbs, c.nbs) |x, y| {
+                if (x.dx != y.dx or x.dy != y.dy or !same(x.a, y.a) or !same(x.b, y.b)) break false;
+            } else true;
+            if (equal) break ti;
+        } else blk: {
+            try types.append(arena, k);
+            break :blk types.items.len - 1;
+        };
+    };
+    if (types.items.len > LETTERS.len) return error.TooManyTypes;
+
+    // bounds for tileable mazes: the boxes must be exactly W x H per period
+    var xmin = std.math.inf(f64);
+    var xmax = -std.math.inf(f64);
+    var ymin = std.math.inf(f64);
+    var ymax = -std.math.inf(f64);
+    for (cells) |c| {
+        xmin = @min(xmin, c.center.x);
+        xmax = @max(xmax, c.center.x);
+        ymin = @min(ymin, c.center.y);
+        ymax = @max(ymax, c.center.y);
+    }
+    const xpad = (t.width - (xmax - xmin)) / 2;
+    const ypad = (t.height - (ymax - ymin)) / 2;
+
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    const basis = t.basis;
+    try w.print("// generated by tools/gen_periodic.zig {s}\n\n", .{which});
+    try w.print("const {s} = struct {{\n", .{t.struct_name});
+    var consts = false;
+    for (basis) |bname| {
+        if (std.mem.eql(u8, bname, "1")) continue;
+        try w.print("    const {s}: f64 = @sqrt({s}.0);\n", .{ bname, bname[4..] });
+        consts = true;
+    }
+    if (consts) try w.writeAll("\n");
+    for (types.items, 0..) |rep, ti| {
+        const nbs = cells[rep].nbs;
+        try w.print("    const {s}_{c}_coords = [_]Vec2{{ // TYPE_{c}\n", .{ t.ident, std.ascii.toLower(LETTERS[ti]), LETTERS[ti] });
+        for (0..nbs.len + 1) |i| {
+            const pt = nbs[i % nbs.len].a;
+            try w.writeAll("        .{ .x = ");
+            try expr(w, pt.x, basis);
+            try w.writeAll(", .y = ");
+            try expr(w, pt.y, basis);
+            try w.writeAll(" },\n");
+        }
+        try w.writeAll("    };\n\n");
+    }
+    try w.print("    pub const {s}_struct = Structure{{\n", .{t.ident});
+    try w.print("        .name = \"{s}\",\n", .{t.title});
+    try w.writeAll("        .kind = \"Periodic\",\n");
+    try w.writeAll("        .construct = .periodic,\n");
+    try w.writeAll("        .features = STRUCTURE_TILEABLE,\n");
+    try w.print("        .rows = {d},\n", .{rows});
+    try w.print("        .columns = {d},\n", .{cols});
+    const fields = [_]struct { []const u8, f64 }{
+        .{ "width", t.width }, .{ "height", t.height },
+        .{ "xminadd", -xpad }, .{ "xmaxadd", xpad },
+        .{ "yminadd", -ypad }, .{ "ymaxadd", ypad },
+    };
+    for (fields) |f| {
+        try w.print("        .{s} = ", .{f[0]});
+        try expr(w, f[1], basis);
+        try w.writeAll(",\n");
+    }
+    try w.writeAll("        .center_points = &.{\n");
+    for (0..rows) |r| {
+        try w.writeAll("            ");
+        for (0..cols) |col| {
+            const c = cellAt(cells, col, r);
+            if (col > 0) try w.writeAll(", ");
+            try w.writeAll(".{ .x = ");
+            try expr(w, c.center.x, basis);
+            try w.writeAll(", .y = ");
+            try expr(w, c.center.y, basis);
+            try w.writeAll(" }");
+        }
+        try w.writeAll(",\n");
+    }
+    try w.writeAll("        },\n");
+    try w.writeAll("        .cell_types = &.{\n");
+    for (0..rows) |r| {
+        try w.writeAll("            ");
+        for (0..cols) |col| {
+            if (col > 0) try w.writeAll(", ");
+            try w.print("TYPE_{c}", .{LETTERS[cellAt(cells, col, r).type]});
+        }
+        try w.writeAll(",\n");
+    }
+    try w.writeAll("        },\n");
+    try w.writeAll("        .neighbours = &.{\n");
+    for (types.items, 0..) |rep, ti| {
+        try w.print("            &.{{ // TYPE_{c}\n", .{LETTERS[ti]});
+        for (cells[rep].nbs, 0..) |nb, i| {
+            try w.print("                nb({d}, {d}, &{s}_{c}_coords, {d}, 0, 0),\n", .{ nb.dx, nb.dy, t.ident, std.ascii.toLower(LETTERS[ti]), i });
+        }
+        try w.writeAll("            },\n");
+    }
+    try w.writeAll("        },\n");
+    try w.writeAll("    };\n");
+    try w.writeAll("};\n");
+
+    var summary: Writer.Allocating = .init(arena);
+    for (types.items, 0..) |rep, ti| {
+        if (ti > 0) try summary.writer.writeAll(",");
+        try summary.writer.print("{c}({d})", .{ LETTERS[ti], cells[rep].nbs.len });
+    }
+    return .{ .code = out.written(), .summary = summary.written() };
+}
+
+fn cellAt(cells: []const Cell, col: usize, row: usize) *const Cell {
+    for (cells) |*c| {
+        if (c.col == col and c.row == row) return c;
+    }
+    unreachable;
+}
+
+fn run(arena: Allocator, which: []const u8, rows: usize) !Generated {
+    for (TILINGS) |t| {
+        if (std.mem.eql(u8, t.name, which)) return generate(arena, which, try t.make(arena), rows);
+    }
+    std.debug.print("unknown tiling '{s}' (known: 4.6.12, floret, pentagonal_1:1, pentagonal_1:2, pentagonal_2:1, pentagonal_2:2, pentagonal_10)\n", .{which});
+    return error.UnknownTiling;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(arena);
+    const which: []const u8 = if (argv.len > 1) argv[1] else "4.6.12";
+    const rows: usize = if (argv.len > 2) try std.fmt.parseInt(usize, argv[2], 10) else 6;
+    const g = run(arena, which, rows) catch |e| switch (e) {
+        error.UnknownTiling, error.BadRows, error.OddRows, error.NotExact, error.BadTiling => std.process.exit(1),
+        else => return e,
+    };
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
+    try stdout.interface.writeAll(g.code);
+    try stdout.interface.flush();
+    std.debug.print("// cell types: [{s}]\n", .{g.summary});
+}
+
+test "4.6.12 has six cell types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const g = try run(arena_state.allocator(), "4.6.12", 6);
+    try std.testing.expectEqualStrings("A(12),B(4),C(4),D(6),E(6),F(4)", g.summary);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, "pub const truncated_trihexagonal_struct = Structure{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, ".width = 3.0 + SQRT3,") != null);
+}
+
+test "floret has six pentagon types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const g = try run(arena_state.allocator(), "floret", 6);
+    try std.testing.expectEqualStrings("A(5),B(5),C(5),D(5),E(5),F(5)", g.summary);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, ".width = SQRT7,") != null);
+}
+
+test "pentagonal type 1 has two cells" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const g = try run(arena_state.allocator(), "pentagonal_1:1", 1);
+    // not edge-to-edge: one wall of every pentagon is split in two
+    try std.testing.expectEqualStrings("A(6),B(6)", g.summary);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, ".width = 7.0 / 4.0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, "@sqrt") == null);
+}
+
+test "pentagonal type 1 cm is edge-to-edge" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const g = try run(arena_state.allocator(), "pentagonal_1:2", 2);
+    try std.testing.expectEqualStrings("A(5),B(5)", g.summary);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, ".width = 5.0 / 2.0,") != null);
+}
+
+test "pentagonal type 2 tilings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // not edge-to-edge: every pentagon's edge d carries a vertex B
+    try std.testing.expectEqualStrings("A(6),B(6),C(6),D(6)", (try run(arena, "pentagonal_2:1", 2)).summary);
+    try std.testing.expectEqualStrings("A(5),B(5),C(5),D(5)", (try run(arena, "pentagonal_2:2", 2)).summary);
+}
+
+test "pentagonal type 10" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const g = try run(arena_state.allocator(), "pentagonal_10", 2);
+    try std.testing.expectEqualStrings("A(5),B(7),C(5),D(5),E(7),F(5)", g.summary);
+    try std.testing.expect(std.mem.indexOf(u8, g.code, ".width = 7.0 * SQRT2,") != null);
+}
+
+test "exact expressions" {
+    var out: Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const basis = [_][]const u8{ "1", "SQRT3" };
+    try expr(&out.writer, 0.5 + 0.5 * S3, &basis);
+    try out.writer.writeAll("|");
+    try expr(&out.writer, -1 - 0.5 * S3, &basis);
+    try out.writer.writeAll("|");
+    try expr(&out.writer, 1 - S3, &basis);
+    try out.writer.writeAll("|");
+    try expr(&out.writer, 0, &basis);
+    try out.writer.writeAll("|");
+    try expr(&out.writer, -0.4375, &.{"1"});
+    try std.testing.expectEqualStrings("1.0 / 2.0 + (1.0 / 2.0) * SQRT3|-1.0 + (-1.0 / 2.0) * SQRT3|1.0 - SQRT3|0.0|-7.0 / 16.0", out.written());
+}
