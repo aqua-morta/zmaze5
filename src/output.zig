@@ -162,16 +162,33 @@ fn renderCopyright(cv: anytype, pr: *const RenderParams) !void {
     try cv.text(txt, pr.width - 8, pr.height, .right_bottom);
 }
 
+/// Which bridges of the crossings: each crossing has a lower and an upper one
+/// (drawn last).
+const Bridges = enum {
+    all,
+    lower,
+    upper,
+
+    fn has(b: Bridges, k: usize) bool {
+        return switch (b) {
+            .all => true,
+            .lower => k == 0,
+            .upper => k == 1,
+        };
+    }
+};
+
 /// The bridges of the crossings. With `cover` their area is filled with the
-/// background color to hide the walls below; otherwise those walls were cut
-/// out already (`bridgeAreas`).
-fn renderCrossovers(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams, cover: bool) !void {
+/// background color to hide the walls and the lower bridge below; otherwise
+/// those were cut out already (`bridgeAreas`).
+fn renderCrossovers(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams, which: Bridges, cover: bool) !void {
     for (m.cells[0..m.n_cells]) |*cell| {
         if (cell.type != mz.TYPE_CROSSOVER) continue;
         var idx: usize = 0;
-        for (0..2) |_| {
+        for (0..2) |k| {
             var s = try render.renderCrossover(gpa, m, cell, &idx, pr);
             defer s.deinit();
+            if (!which.has(k)) continue;
             if (cover) {
                 try cv.setColor(pr.background);
                 try renderArea(cv, &s);
@@ -189,16 +206,17 @@ fn hasCrossovers(m: *const Maze) bool {
     return false;
 }
 
-/// Adds the areas of all bridges to the current path, all with the same
+/// Adds the areas of the bridges to the current path, all with the same
 /// orientation: bridges of neighbouring crossings overlap a little, and with
 /// opposite orientations the overlap would be a hole (nonzero winding).
-fn bridgeAreas(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams) !void {
+fn bridgeAreas(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams, which: Bridges) !void {
     for (m.cells[0..m.n_cells]) |*cell| {
         if (cell.type != mz.TYPE_CROSSOVER) continue;
         var idx: usize = 0;
-        for (0..2) |_| {
+        for (0..2) |k| {
             var s = try render.renderCrossover(gpa, m, cell, &idx, pr);
             defer s.deinit();
+            if (!which.has(k)) continue;
             const pts = s.points.items;
             if (pts.len < 3) continue;
             var area: f64 = 0;
@@ -247,10 +265,17 @@ fn drawMaze(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams) !voi
         try renderStroke(cv, &s);
     }
     if (knockout) {
-        try bridgeAreas(gpa, cv, m, pr);
+        try bridgeAreas(gpa, cv, m, pr, .all);
         try cv.endKnockout();
+        // the same for the lower bridges below the upper ones
+        try cv.beginKnockout();
+        try renderCrossovers(gpa, cv, m, pr, .lower, false);
+        try bridgeAreas(gpa, cv, m, pr, .upper);
+        try cv.endKnockout();
+        try renderCrossovers(gpa, cv, m, pr, .upper, false);
+    } else {
+        try renderCrossovers(gpa, cv, m, pr, .all, true);
     }
-    try renderCrossovers(gpa, cv, m, pr, !knockout);
     try cv.setColor(pr.foreground);
     if (pr.draw_marks) {
         var s = try render.renderEntryExit(gpa, m, m.entrance, pr);
