@@ -1,6 +1,6 @@
 # maze5 (Zig)
 
-A Zig rewrite of **maze5 0.9.0** by Bernd Breitenbach, a generator for mazes
+A Zig rewrite and extended version of **maze5 0.9.0** by Bernd Breitenbach, a generator for mazes
 of many styles (orthogonal, hexagonal, triangular, cairo, octagon-square,
 theta/circular, Klaassen's pentagons with n-fold rotational symmetry, voronoi based, aperiodic Penrose kites and darts,
 Ammann–Beenker squares and rhombi, the supergolden stepped plane, the 12-fold shield and Socolar tilings, the 10-fold clamshell tiling, the "einstein" hat monotile, …) that writes PDF, SVG or PNG files.
@@ -103,9 +103,7 @@ const log = new TextDecoder().decode(new Uint8Array(m.memory.buffer, m.maze5_log
 
 `maze5_types()` puts a JSON description of all maze types (specification,
 names, features, cell types) into the result, `maze5_version()` the version.
-A panic traps; its message can be read with `maze5_panic_ptr/len`. The
-module is used by the [mocms](../mocms) website, which embeds the generator
-in a page.
+A panic traps; its message can be read with `maze5_panic_ptr/len`. 
 
 ## Source layout
 
