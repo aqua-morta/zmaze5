@@ -22,6 +22,9 @@
 //!   outputs' text.
 //!
 //! Colors are blended with the "over" operator on premultiplied pixels.
+//! A knockout group is drawn on a cleared image (the pixels below are kept
+//! aside), its cut out area is erased, then it is blended over the pixels
+//! below.
 
 const std = @import("std");
 const geo = @import("geo.zig");
@@ -79,6 +82,10 @@ pub const Canvas = struct {
     // scratch buffers
     edges: std.ArrayListUnmanaged(Edge) = .empty,
     poly: std.ArrayListUnmanaged(Vec2) = .empty,
+    /// the pixels below the open knockout group
+    backdrop: ?[]u8 = null,
+    /// fills erase (reduce the alpha by the coverage) instead of painting
+    erasing: bool = false,
 
     pub fn init(gpa: Allocator, width: usize, height: usize) !Canvas {
         const pixels = try gpa.alloc(u8, width * height * 4);
@@ -92,6 +99,7 @@ pub const Canvas = struct {
         cv.subpaths.deinit(cv.gpa);
         cv.edges.deinit(cv.gpa);
         cv.poly.deinit(cv.gpa);
+        if (cv.backdrop) |b| cv.gpa.free(b);
     }
 
     // -- state ---------------------------------------------------------
@@ -246,6 +254,31 @@ pub const Canvas = struct {
         cv.clearPath();
     }
 
+    // -- knockout (see vector.zig) --------------------------------------
+
+    pub fn beginKnockout(cv: *Canvas) !void {
+        std.debug.assert(cv.backdrop == null);
+        cv.backdrop = try cv.gpa.dupe(u8, cv.pixels);
+        @memset(cv.pixels, 0);
+    }
+
+    /// Erases the area of the current path from the group's drawing and
+    /// blends the group over the pixels below.
+    pub fn endKnockout(cv: *Canvas) !void {
+        const below = cv.backdrop.?;
+        cv.backdrop = null;
+        defer cv.gpa.free(below);
+        cv.erasing = true;
+        defer cv.erasing = false;
+        try cv.fill();
+        const px = cv.pixels;
+        var i: usize = 0;
+        while (i < px.len) : (i += 4) {
+            const keep: u32 = 255 - @as(u32, px[i + 3]);
+            for (0..4) |k| px[i + k] = @intCast(@min(255, @as(u32, px[i + k]) + (@as(u32, below[i + k]) * keep + 127) / 255));
+        }
+    }
+
     fn fillPath(cv: *Canvas) !void {
         cv.edges.clearRetainingCapacity();
         for (cv.subpaths.items) |sp| {
@@ -360,7 +393,7 @@ pub const Canvas = struct {
     /// Fills the current edge list with the current color.
     fn rasterize(cv: *Canvas) !void {
         const edges = cv.edges.items;
-        if (edges.len == 0 or cv.color.alpha <= 0) return;
+        if (edges.len == 0 or (cv.color.alpha <= 0 and !cv.erasing)) return;
         std.mem.sortUnstable(Edge, edges, {}, struct {
             fn lt(_: void, a: Edge, b: Edge) bool {
                 return a.y0 < b.y0;
@@ -461,6 +494,10 @@ pub const Canvas = struct {
     }
 
     fn blend(cv: *Canvas, idx: usize, cov: f32) void {
+        if (cv.erasing) {
+            for (cv.pixels[idx * 4 ..][0..4]) |*c| c.* = @intFromFloat(@round(@as(f32, @floatFromInt(c.*)) * (1 - cov)));
+            return;
+        }
         const col = cv.color;
         const a: f32 = @as(f32, @floatCast(col.alpha)) * cov;
         const px = cv.pixels[idx * 4 ..][0..4];
@@ -724,6 +761,30 @@ test "overlapping strokes don't add up" {
     try std.testing.expectEqual(@as(u8, 128), pixel(&cv, 4, 10)[3]);
     // round caps reach beyond the end points
     try std.testing.expect(pixel(&cv, 0, 10)[3] > 0);
+}
+
+test "knockout cuts only the group's drawing" {
+    const gpa = std.testing.allocator;
+    var cv = try Canvas.init(gpa, 10, 10);
+    defer cv.deinit();
+    // half transparent background below the group
+    try cv.setColor(.{ .red = 1, .green = 0, .blue = 0, .alpha = 0.5 });
+    try cv.rectangle(0, 0, 10, 10);
+    try cv.fill();
+    try cv.beginKnockout();
+    try cv.setColor(.{ .red = 0, .green = 0, .blue = 1 });
+    try cv.rectangle(0, 0, 10, 10);
+    try cv.fill();
+    try cv.rectangle(2, 2, 3, 3);
+    try cv.endKnockout();
+    // the hole shows the background, elsewhere the group covers it
+    try std.testing.expectEqual([4]u8{ 128, 0, 0, 128 }, pixel(&cv, 3, 3));
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, pixel(&cv, 7, 7));
+    // painting works normally afterwards
+    try cv.setColor(.{ .red = 0, .green = 1, .blue = 0 });
+    try cv.rectangle(2, 2, 3, 3);
+    try cv.fill();
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, pixel(&cv, 3, 3));
 }
 
 test "circle area" {

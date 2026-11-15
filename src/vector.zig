@@ -13,6 +13,11 @@
 //! Helvetica font in PDF (no embedding needed); its widths are known, so
 //! text can be centered exactly in PDF. In SVG text is centered with
 //! `text-anchor`.
+//!
+//! A knockout group (`beginKnockout`/`endKnockout`) cuts an area out of the
+//! drawing inside it, e.g. the walls below the bridges of crossings when the
+//! background is transparent and can't hide them. SVG uses a `<mask>`, PDF a
+//! luminosity soft mask (an ExtGState with a form XObject).
 
 const std = @import("std");
 const geo = @import("geo.zig");
@@ -54,6 +59,18 @@ pub const Canvas = struct {
     alphas: std.ArrayListUnmanaged(f64) = .empty,
     pdf_alpha: f64 = 1,
     pdf_color_set: bool = false,
+    /// user to page: x' = a·x + c·y + e, y' = b·x + d·y + f (y down; for the
+    /// bounds of knockout masks)
+    ctm: [6]f64 = .{ 1, 0, 0, 1, 0, 0 },
+    /// the state at the start of the open knockout group
+    knockout: ?KnockoutStart = null,
+    knockout_count: usize = 0,
+    /// PDF: the soft masks of the knockout groups
+    masks: std.ArrayListUnmanaged(Mask) = .empty,
+
+    const KnockoutStart = struct { color: Color, line_width: f64, pdf_alpha: f64, groups: usize };
+    /// The bounding box (user space) and the content stream of a soft mask.
+    const Mask = struct { box: [4]f64, content: []u8 };
 
     pub fn init(gpa: Allocator, kind: Kind, width: f64, height: f64) Canvas {
         return .{ .gpa = gpa, .kind = kind, .width = width, .height = height };
@@ -63,6 +80,8 @@ pub const Canvas = struct {
         cv.body.deinit(cv.gpa);
         cv.path.deinit(cv.gpa);
         cv.alphas.deinit(cv.gpa);
+        for (cv.masks.items) |m| cv.gpa.free(m.content);
+        cv.masks.deinit(cv.gpa);
     }
 
     fn out(cv: *Canvas, comptime fmt: []const u8, args: anytype) !void {
@@ -101,6 +120,9 @@ pub const Canvas = struct {
     }
 
     pub fn translate(cv: *Canvas, x: f64, y: f64) !void {
+        const m = &cv.ctm;
+        m[4] += m[0] * x + m[2] * y;
+        m[5] += m[1] * x + m[3] * y;
         switch (cv.kind) {
             .svg => {
                 try cv.out("<g transform=\"translate({d:.4},{d:.4})\">\n", .{ x, y });
@@ -113,6 +135,13 @@ pub const Canvas = struct {
     /// Rotation by `a` radians (clockwise on the page, like cairo's).
     pub fn rotate(cv: *Canvas, a: f64) !void {
         if (a == 0) return;
+        const sa = @sin(a);
+        const ca = @cos(a);
+        const m = cv.ctm;
+        cv.ctm[0] = m[0] * ca + m[2] * sa;
+        cv.ctm[1] = m[1] * ca + m[3] * sa;
+        cv.ctm[2] = -m[0] * sa + m[2] * ca;
+        cv.ctm[3] = -m[1] * sa + m[3] * ca;
         switch (cv.kind) {
             .svg => {
                 try cv.out("<g transform=\"rotate({d:.6})\">\n", .{a * 180.0 / std.math.pi});
@@ -279,6 +308,80 @@ pub const Canvas = struct {
         try cv.paint(.fill_stroke);
     }
 
+    // -- knockout ------------------------------------------------------
+
+    /// Starts a knockout group: `endKnockout` cuts an area out of everything
+    /// drawn in between (only out of that, not out of what lies below). The
+    /// transformation must not change inside the group.
+    pub fn beginKnockout(cv: *Canvas) !void {
+        std.debug.assert(cv.knockout == null);
+        cv.knockout = .{ .color = cv.color, .line_width = cv.line_width, .pdf_alpha = cv.pdf_alpha, .groups = cv.groups };
+        switch (cv.kind) {
+            .svg => try cv.out("<g mask=\"url(#knockout{d})\">\n", .{cv.knockout_count}),
+            .pdf => try cv.out("q /KO{d} gs\n", .{cv.knockout_count}),
+        }
+    }
+
+    /// Ends the knockout group, cutting out the area of the current path
+    /// (nonzero winding); the path is consumed like by `fill`.
+    pub fn endKnockout(cv: *Canvas) !void {
+        const start = cv.knockout.?;
+        std.debug.assert(start.groups == cv.groups);
+        cv.knockout = null;
+        defer {
+            cv.path.clearRetainingCapacity();
+            cv.current = null;
+            cv.subpath_start = null;
+        }
+        const id = cv.knockout_count;
+        cv.knockout_count += 1;
+        // the mask is white (drawn) on the whole page, black in the area
+        const b = cv.userBounds();
+        const x, const y, const w, const h = .{ num(b[0]), num(b[1]), num(b[2] - b[0]), num(b[3] - b[1]) };
+        switch (cv.kind) {
+            .svg => {
+                try cv.out("</g>\n<mask id=\"knockout{d}\" maskUnits=\"userSpaceOnUse\" x=\"{f}\" y=\"{f}\" width=\"{f}\" height=\"{f}\">\n", .{ id, x, y, w, h });
+                try cv.out("<rect x=\"{f}\" y=\"{f}\" width=\"{f}\" height=\"{f}\" fill=\"white\"/>\n", .{ x, y, w, h });
+                if (cv.path.items.len > 0) try cv.out("<path d=\"{s}\" fill=\"black\"/>\n", .{cv.path.items});
+                try cv.out("</mask>\n", .{});
+            },
+            .pdf => {
+                try cv.out("Q\n", .{});
+                var content: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer content.deinit(cv.gpa);
+                try content.print(cv.gpa, "1 g {f} {f} {f} {f} re f 0 g\n", .{ x, y, w, h });
+                if (cv.path.items.len > 0) {
+                    try content.appendSlice(cv.gpa, cv.path.items);
+                    try content.appendSlice(cv.gpa, "f\n");
+                }
+                const owned = try content.toOwnedSlice(cv.gpa);
+                errdefer cv.gpa.free(owned);
+                try cv.masks.append(cv.gpa, .{ .box = b, .content = owned });
+                // `Q` restored the graphics state of the group's start; set
+                // the current color and line width again
+                cv.pdf_alpha = start.pdf_alpha;
+                try cv.setColor(cv.color);
+                if (cv.line_width != start.line_width) try cv.setLineWidth(cv.line_width);
+            },
+        }
+    }
+
+    /// Bounding box [x0, y0, x1, y1] of the page in user coordinates (a
+    /// little larger, so masks cover the page completely).
+    fn userBounds(cv: *const Canvas) [4]f64 {
+        const m = cv.ctm;
+        const det = m[0] * m[3] - m[1] * m[2];
+        var b = [4]f64{ std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
+        for ([_][2]f64{ .{ 0, 0 }, .{ cv.width, 0 }, .{ 0, cv.height }, .{ cv.width, cv.height } }) |p| {
+            const px = p[0] - m[4];
+            const py = p[1] - m[5];
+            const ux = (m[3] * px - m[2] * py) / det;
+            const uy = (-m[1] * px + m[0] * py) / det;
+            b = .{ @min(b[0], ux), @min(b[1], uy), @max(b[2], ux), @max(b[3], uy) };
+        }
+        return .{ @floor(b[0]) - 1, @floor(b[1]) - 1, @ceil(b[2]) + 1, @ceil(b[3]) + 1 };
+    }
+
     // -- text ----------------------------------------------------------
 
     pub fn text(cv: *Canvas, str: []const u8, x: f64, y: f64, alignment: TextAlign) !void {
@@ -350,7 +453,10 @@ pub const Canvas = struct {
         defer offsets.deinit(gpa);
         try doc.appendSlice(gpa, "%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");
         const first_gs = 6;
-        // 1: catalog, 2: pages, 3: page, 4: contents, 5: font, 6..: alpha states
+        // 1: catalog, 2: pages, 3: page, 4: contents, 5: font, 6..: alpha
+        // states, then a graphics state and a form (the soft mask) per
+        // knockout group
+        const first_ko = first_gs + cv.alphas.items.len;
         try offsets.append(gpa, doc.items.len);
         try doc.appendSlice(gpa, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
         try offsets.append(gpa, doc.items.len);
@@ -358,6 +464,7 @@ pub const Canvas = struct {
         try offsets.append(gpa, doc.items.len);
         try doc.print(gpa, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {d} {d}] /Contents 4 0 R\n   /Resources << /Font << /F1 5 0 R >> /ExtGState <<", .{ cv.width, cv.height });
         for (0..cv.alphas.items.len) |i| try doc.print(gpa, " /GS{d} {d} 0 R", .{ i, first_gs + i });
+        for (0..cv.masks.items.len) |i| try doc.print(gpa, " /KO{d} {d} 0 R", .{ i, first_ko + 2 * i });
         try doc.appendSlice(gpa, " >> >> >>\nendobj\n");
         // content: flip the y axis (cairo's coordinates have y down)
         var content: std.ArrayListUnmanaged(u8) = .empty;
@@ -375,6 +482,17 @@ pub const Canvas = struct {
         for (cv.alphas.items, 0..) |a, i| {
             try offsets.append(gpa, doc.items.len);
             try doc.print(gpa, "{d} 0 obj\n<< /Type /ExtGState /ca {d:.4} /CA {d:.4} >>\nendobj\n", .{ first_gs + i, a, a });
+        }
+        for (cv.masks.items, 0..) |m, i| {
+            const gs = first_ko + 2 * i;
+            try offsets.append(gpa, doc.items.len);
+            try doc.print(gpa, "{d} 0 obj\n<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G {d} 0 R >> >>\nendobj\n", .{ gs, gs + 1 });
+            const mz = try deflate(gpa, m.content);
+            defer gpa.free(mz);
+            try offsets.append(gpa, doc.items.len);
+            try doc.print(gpa, "{d} 0 obj\n<< /Type /XObject /Subtype /Form /BBox [{f} {f} {f} {f}]\n   /Group << /Type /Group /S /Transparency /CS /DeviceRGB >> /Length {d} /Filter /FlateDecode >>\nstream\n", .{ gs + 1, num(m.box[0]), num(m.box[1]), num(m.box[2]), num(m.box[3]), mz.len });
+            try doc.appendSlice(gpa, mz);
+            try doc.appendSlice(gpa, "\nendstream\nendobj\n");
         }
         const xref = doc.items.len;
         try doc.print(gpa, "xref\n0 {d}\n0000000000 65535 f \n", .{offsets.items.len + 1});
@@ -477,6 +595,42 @@ test "svg document" {
     try std.testing.expect(std.mem.indexOf(u8, doc, "<path d=\"M1 2L3 4\" fill=\"none\" stroke=\"#ff0000\" stroke-opacity=\"0.5000\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, doc, ">A&lt;B</text>") != null);
     try std.testing.expect(std.mem.endsWith(u8, doc, "</svg>\n"));
+}
+
+test "svg knockout uses a mask in the user space" {
+    const gpa = std.testing.allocator;
+    var cv = Canvas.init(gpa, .svg, 100, 50);
+    defer cv.deinit();
+    try cv.translate(10, 20);
+    try cv.beginKnockout();
+    try cv.moveTo(0, 0);
+    try cv.lineTo(50, 0);
+    try cv.stroke();
+    try cv.rectangle(5, -5, 10, 10);
+    try cv.endKnockout();
+    const doc = try cv.finish();
+    defer gpa.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "<g mask=\"url(#knockout0)\">\n<path d=\"M0 0L50 0\"") != null);
+    // the white rectangle covers the page (shifted by the translation)
+    try std.testing.expect(std.mem.indexOf(u8, doc, "<rect x=\"-11\" y=\"-21\" width=\"102\" height=\"52\" fill=\"white\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "fill=\"black\"/>\n</mask>") != null);
+}
+
+test "pdf knockout restores the graphics state" {
+    const gpa = std.testing.allocator;
+    var cv = Canvas.init(gpa, .pdf, 100, 50);
+    defer cv.deinit();
+    try cv.setColor(.{ .red = 0, .green = 0, .blue = 1, .alpha = 0.5 });
+    try cv.beginKnockout();
+    try cv.setColor(.{ .red = 1, .green = 0, .blue = 0, .alpha = 1 });
+    try cv.setLineWidth(3);
+    try cv.rectangle(5, 5, 10, 10);
+    try cv.endKnockout();
+    try std.testing.expect(std.mem.endsWith(u8, cv.body.items, "Q\n1.0000 0.0000 0.0000 rg 1.0000 0.0000 0.0000 RG\n/GS1 gs\n3.0000 w\n"));
+    const doc = try cv.finish();
+    defer gpa.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "/KO0 8 0 R") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "8 0 obj\n<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 9 0 R >> >>") != null);
 }
 
 test "pdf document has a valid xref table" {

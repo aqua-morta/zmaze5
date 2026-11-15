@@ -162,17 +162,55 @@ fn renderCopyright(cv: anytype, pr: *const RenderParams) !void {
     try cv.text(txt, pr.width - 8, pr.height, .right_bottom);
 }
 
-fn renderCrossovers(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams) !void {
+/// The bridges of the crossings. With `cover` their area is filled with the
+/// background color to hide the walls below; otherwise those walls were cut
+/// out already (`bridgeAreas`).
+fn renderCrossovers(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams, cover: bool) !void {
     for (m.cells[0..m.n_cells]) |*cell| {
         if (cell.type != mz.TYPE_CROSSOVER) continue;
         var idx: usize = 0;
         for (0..2) |_| {
             var s = try render.renderCrossover(gpa, m, cell, &idx, pr);
             defer s.deinit();
-            try cv.setColor(pr.background);
-            try renderArea(cv, &s);
+            if (cover) {
+                try cv.setColor(pr.background);
+                try renderArea(cv, &s);
+            }
             try cv.setColor(pr.foreground);
             try renderOutline(cv, &s);
+        }
+    }
+}
+
+fn hasCrossovers(m: *const Maze) bool {
+    for (m.cells[0..m.n_cells]) |*cell| {
+        if (cell.type == mz.TYPE_CROSSOVER) return true;
+    }
+    return false;
+}
+
+/// Adds the areas of all bridges to the current path, all with the same
+/// orientation: bridges of neighbouring crossings overlap a little, and with
+/// opposite orientations the overlap would be a hole (nonzero winding).
+fn bridgeAreas(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams) !void {
+    for (m.cells[0..m.n_cells]) |*cell| {
+        if (cell.type != mz.TYPE_CROSSOVER) continue;
+        var idx: usize = 0;
+        for (0..2) |_| {
+            var s = try render.renderCrossover(gpa, m, cell, &idx, pr);
+            defer s.deinit();
+            const pts = s.points.items;
+            if (pts.len < 3) continue;
+            var area: f64 = 0;
+            for (pts, 0..) |a, i| {
+                const b = pts[(i + 1) % pts.len];
+                area += a.p.x * b.p.y - a.p.y * b.p.x;
+            }
+            for (0..pts.len) |i| {
+                const p = pts[if (area < 0) pts.len - 1 - i else i].p;
+                if (i == 0) try cv.moveTo(p.x, p.y) else try cv.lineTo(p.x, p.y);
+            }
+            try cv.closePath();
         }
     }
 }
@@ -191,6 +229,11 @@ fn drawMaze(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams) !voi
         try cv.fill();
     }
     try renderCopyright(cv, pr);
+    // A bridge hides the walls below it by covering them with the background
+    // color. A (partly) transparent background can't, so the bridges are cut
+    // out of the walls and pillars instead.
+    const knockout = pr.background.alpha < 1 and hasCrossovers(m);
+    if (knockout) try cv.beginKnockout();
     try cv.setColor(pr.pillar orelse pr.foreground);
     {
         var s = try render.renderPillars(gpa, m, pr);
@@ -203,7 +246,11 @@ fn drawMaze(gpa: Allocator, cv: anytype, m: *Maze, pr: *const RenderParams) !voi
         defer s.deinit();
         try renderStroke(cv, &s);
     }
-    try renderCrossovers(gpa, cv, m, pr);
+    if (knockout) {
+        try bridgeAreas(gpa, cv, m, pr);
+        try cv.endKnockout();
+    }
+    try renderCrossovers(gpa, cv, m, pr, !knockout);
     try cv.setColor(pr.foreground);
     if (pr.draw_marks) {
         var s = try render.renderEntryExit(gpa, m, m.entrance, pr);

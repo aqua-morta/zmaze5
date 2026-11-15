@@ -154,6 +154,10 @@ A panic traps; its message can be read with `maze5_panic_ptr/len`.
   of the maze unreachable). Mazes with crossovers therefore differ from the
   original, and very high densities are reached less often (a warning says
   how many crossovers were built).
+* Bridges of crossovers work with a transparent background (`-B transparent`
+  or an `rgba(…)` with alpha below 1): instead of being painted over with the
+  background color, the walls and pillars below a bridge are cut out (SVG
+  mask, PDF soft mask). Mazes with an opaque background are drawn as before.
 * New algorithm `-a wilson` (Wilson's loop-erased random walks): every
   perfect maze of the grid is equally likely, so it has no bias towards long
   corridors (backtracker) or short dead ends (Prim). It works on all maze

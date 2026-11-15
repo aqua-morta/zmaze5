@@ -1,10 +1,10 @@
 {
 	"folders": [
 		{
-			"path": "."
+			"path": "../mocms"
 		},
 		{
-			"path": "../mocms"
+			"path": "../zmaze5"
 		}
 	],
 	"settings": {}
